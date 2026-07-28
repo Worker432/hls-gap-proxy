@@ -97,6 +97,11 @@ async function proxy(target, req, res, startedAt, requestUrl) {
     contentType: upstreamContentType
   })
 
+  if (!upstream.ok) {
+    await passThroughUpstreamError(upstream, req, res, startedAt, requestUrl, targetUrl)
+    return
+  }
+
   if (isPlaylist(targetUrl, upstream)) {
     const text = await upstream.text()
     const body = rewritePlaylist(text, targetUrl.toString(), {
@@ -155,17 +160,40 @@ async function proxy(target, req, res, startedAt, requestUrl) {
   bodyStream.pipe(res)
 }
 
+async function passThroughUpstreamError(upstream, req, res, startedAt, requestUrl, targetUrl) {
+  const body = await upstream.text()
+  const trimmedBody = body.trim()
+
+  log('warn', `upstream error ${upstream.status}: ${truncate(trimmedBody || '<empty body>', 1000)}`, {
+    upstreamUrl: targetUrl.toString(),
+    upstreamStatus: upstream.status,
+    body: truncate(trimmedBody, 4000)
+  })
+
+  res.writeHead(upstream.status, responseHeaders(upstream))
+  res.end(body)
+  logDone(req, requestUrl, upstream.status, startedAt)
+}
+
 function isPlaylist(targetUrl, upstream) {
   const contentType = upstream.headers.get('content-type') ?? ''
-  return targetUrl.pathname.endsWith('.m3u8') ||
-    contentType.includes('mpegurl') ||
-    contentType.includes('application/vnd.apple.mpegurl')
+  if (contentType.includes('mpegurl') || contentType.includes('application/vnd.apple.mpegurl')) {
+    return true
+  }
+
+  if (contentType && !contentType.includes('text/plain') && !contentType.includes('octet-stream')) {
+    return false
+  }
+
+  return targetUrl.pathname.endsWith('.m3u8')
 }
 
 function buildUpstreamHeaders(req) {
-  const headers = {}
+  const headers = {
+    'user-agent': process.env.MEDIA_PROXY_USER_AGENT ?? 'media-proxy/0.1'
+  }
 
-  for (const name of ['range', 'user-agent', 'accept', 'accept-language']) {
+  for (const name of ['range', 'accept', 'accept-language']) {
     const value = req.headers[name]
     if (value) {
       headers[name] = Array.isArray(value) ? value.join(', ') : value
@@ -308,6 +336,14 @@ function dumpPlaylistIfNeeded(targetUrl, requestUrl, originalText, rewrittenText
 
 function countMatches(text, pattern) {
   return Array.from(text.matchAll(pattern)).length
+}
+
+function truncate(text, maxLength) {
+  if (text.length <= maxLength) {
+    return text
+  }
+
+  return `${text.slice(0, maxLength)}...`
 }
 
 function log(level, message, fields = {}) {
